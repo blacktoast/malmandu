@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:malmandu}",
+      "name": "Debug Malmandu",
+      "target": "Malmandu",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug Malmandu"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:malmandu}",
+      "name": "Release Malmandu",
+      "target": "Malmandu",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release Malmandu"
+    }
+  ]
+}
