@@ -21,7 +21,8 @@ let package = Package(
         .executableTarget(
             name: "Malmandu",
             dependencies: ["MalmanduCore"],
-            path: "Sources/Malmandu"
+            path: "Sources/Malmandu",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "MalmanduCoreTests",
