@@ -20,7 +20,11 @@ struct MalmanduApp: App {
                 .environment(appDelegate.appState)
                 .environment(appDelegate.coordinator)
         } label: {
-            Label("malmandu", systemImage: menuBarIcon(for: appDelegate.appState.status))
+            Label {
+                Text("malmandu")
+            } icon: {
+                Image(nsImage: Self.manduTemplateImage)
+            }
         }
 
         // 테스트용 메인 윈도우 (디버그)
@@ -37,14 +41,15 @@ struct MalmanduApp: App {
         }
     }
 
-    private func menuBarIcon(for status: AppStatus) -> String {
-        switch status {
-        case .idle: return "mic.circle"
-        case .recording: return "mic.circle.fill"
-        case .transcribing: return "ellipsis.circle"
-        case .error: return "exclamationmark.circle"
+    private static let manduTemplateImage: NSImage = {
+        // Bundle.image(forResource:)는 @2x/@3x 파일을 자동 선택한다.
+        if let img = Bundle.module.image(forResource: "mandu-template") {
+            img.size = NSSize(width: 22, height: 22)
+            img.isTemplate = true
+            return img
         }
-    }
+        return NSImage(systemSymbolName: "mic.circle", accessibilityDescription: nil) ?? NSImage()
+    }()
 }
 
 // MARK: - AppDelegate
