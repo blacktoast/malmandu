@@ -64,6 +64,15 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 cp "$BINARY_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
 cp "$DIST_DIR/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+find "$BIN_DIR" -maxdepth 1 -type d -name '*.bundle' \
+  -exec cp -R {} "$APP_DIR/Contents/Resources/" \;
+
+for bundle in malmandu_Malmandu.bundle malmandu_MalmanduCore.bundle; do
+  if [ ! -d "$APP_DIR/Contents/Resources/$bundle" ]; then
+    echo "❌ 앱 리소스 번들을 찾을 수 없습니다: $bundle" >&2
+    exit 1
+  fi
+done
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
