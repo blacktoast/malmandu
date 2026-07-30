@@ -49,6 +49,8 @@ public final class AppState: @unchecked Sendable {
     public var startingAppName: String? = nil
     /// 포커스 이탈 여부
     public var focusLost: Bool = false
+    /// 원래 앱으로 돌아온 뒤 대기 문장 붙여넣기 확인이 필요한지 여부
+    public var isAwaitingPendingPaste: Bool = false
     /// 오디오 레벨 히스토리 (7개 값, 미러링하여 14개 바 표시, 0.0~1.0)
     public var audioLevels: [CGFloat] = Array(repeating: 0, count: 7)
 
@@ -58,6 +60,7 @@ public final class AppState: @unchecked Sendable {
         partialTranscription = nil
         startingAppName = nil
         focusLost = false
+        isAwaitingPendingPaste = false
         audioLevels = Array(repeating: 0, count: 7)
     }
 

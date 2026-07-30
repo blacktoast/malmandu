@@ -15,8 +15,7 @@ public final class TextInjector: TextInjectorProtocol, @unchecked Sendable {
         let backup = pasteboard.string(forType: .string)
 
         // 2. 텍스트를 클립보드에 복사 (권한과 무관하게 항상 선행)
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        copyText(text)
 
         // 3. Accessibility 권한 확인 — 없으면 최초 1회 시스템 프롬프트 유도 후 결과 반환
         guard accessibilityService.isAccessibilityEnabled() else {
@@ -30,11 +29,16 @@ public final class TextInjector: TextInjectorProtocol, @unchecked Sendable {
         // 5. 딜레이 후 클립보드 복원
         try? await Task.sleep(for: .milliseconds(200))
         if let backup {
-            pasteboard.clearContents()
-            pasteboard.setString(backup, forType: .string)
+            copyText(backup)
         }
 
         return .success
+    }
+
+    public func copyText(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     private func sendPasteKeyEvent() {

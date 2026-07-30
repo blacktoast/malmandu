@@ -78,12 +78,19 @@ final class MockGroqAPIClient: GroqAPIClientProtocol, @unchecked Sendable {
 final class MockTextInjector: TextInjectorProtocol, @unchecked Sendable {
     var pasteTextCalled = false
     var lastPastedText: String? = nil
+    var pastedTexts: [String] = []
+    var lastCopiedText: String? = nil
     var pasteResult: PasteResult = .success
 
     func pasteText(_ text: String) async -> PasteResult {
         pasteTextCalled = true
         lastPastedText = text
+        pastedTexts.append(text)
         return pasteResult
+    }
+
+    func copyText(_ text: String) {
+        lastCopiedText = text
     }
 }
 
@@ -137,6 +144,10 @@ final class MockStreamingSTTClient: StreamingSTTServiceProtocol, @unchecked Send
 
     func pauseStreaming() async {}
     func resumeStreaming() async {}
+
+    func emitPartialResult(_ text: String) {
+        onPartialResult?(text)
+    }
 }
 
 // MARK: - MockSoundService

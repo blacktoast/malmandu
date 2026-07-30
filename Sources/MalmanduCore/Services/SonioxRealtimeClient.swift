@@ -200,7 +200,7 @@ public final class SonioxRealtimeClient: STTServiceProtocol, StreamingSTTService
             }
         }
 
-        flushPendingPaste()
+        await flushPendingPaste()
         receiveTask?.cancel()
         task.cancel(with: .normalClosure, reason: nil)
         wsTask = nil
@@ -245,7 +245,7 @@ public final class SonioxRealtimeClient: STTServiceProtocol, StreamingSTTService
         // 침묵으로 이미 소켓이 끊긴 경우 — 추가 작업 불필요
         silenceDisconnectTask?.cancel()
         guard let task = wsTask, isSocketConnected else {
-            flushPendingPaste()
+            await flushPendingPaste()
             let remaining = remainingText.trimmingCharacters(in: .whitespacesAndNewlines)
             let delivered = segmentsDelivered
             cleanup()
@@ -495,19 +495,24 @@ public final class SonioxRealtimeClient: STTServiceProtocol, StreamingSTTService
             self.pendingPaste = ""
             if !text.isEmpty {
                 self.segmentsDelivered = true
-                self.onSegmentFinalized?(String(text))
+                await self.onSegmentFinalized?(String(text))
             }
         }
     }
 
     /// 버퍼에 남은 텍스트를 즉시 플러시
-    private func flushPendingPaste() {
-        pasteTask?.cancel()
+    private func flushPendingPaste() async {
+        let activePasteTask = pasteTask
+        activePasteTask?.cancel()
+        if let activePasteTask {
+            await activePasteTask.value
+        }
+        pasteTask = nil
         let text = pendingPaste.trimmingCharacters(in: .whitespacesAndNewlines)
         pendingPaste = ""
         if !text.isEmpty {
             segmentsDelivered = true
-            onSegmentFinalized?(text)
+            await onSegmentFinalized?(text)
         }
     }
 

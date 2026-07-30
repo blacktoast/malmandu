@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import Observation
-import SwiftUI
 
 /// 녹음 → STT → 붙여넣기 파이프라인 조율자
 @Observable
@@ -18,6 +17,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
     private let apiKeyCheck: () -> Bool
     private let audioProcessor: AudioProcessorProtocol
     private let streamingClientProvider: () -> (any StreamingSTTServiceProtocol)?
+    private let frontmostAppBundleId: @Sendable () -> String?
     private let textPolisher: TextPolisher?
     private let polishEnabled: () -> Bool
 
@@ -34,6 +34,10 @@ public final class RecordingCoordinator: @unchecked Sendable {
     private let audioChunkBufferLimit = 150  // 64ms * 150 ≈ 9.6초
     /// RT 모드 초기화 중 stop이 호출됐는지 플래그
     private var stopRequested = false
+    /// 대기 문장 중복 붙여넣기 방지
+    private var pendingPasteInProgress = false
+    /// 취소 중 스트림 종료가 내보내는 마지막 확정 문장 폐기
+    private var discardFinalizedSegments = false
 
     /// 상태 변경 콜백 (오버레이 제어용)
     public var onStatusChange: ((AppStatus) -> Void)?
@@ -53,6 +57,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
         apiKeyCheck: @escaping () -> Bool = { true },
         audioProcessor: AudioProcessorProtocol = AudioProcessor(),
         streamingClientProvider: @escaping () -> (any StreamingSTTServiceProtocol)? = { nil },
+        frontmostAppBundleId: @escaping @Sendable () -> String? = { FocusDetector().frontmostAppBundleId() },
         textPolisher: TextPolisher? = nil,
         polishEnabled: @escaping () -> Bool = { false }
     ) {
@@ -68,6 +73,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
         self.apiKeyCheck = apiKeyCheck
         self.audioProcessor = audioProcessor
         self.streamingClientProvider = streamingClientProvider
+        self.frontmostAppBundleId = frontmostAppBundleId
         self.textPolisher = textPolisher
         self.polishEnabled = polishEnabled
     }
@@ -85,9 +91,12 @@ public final class RecordingCoordinator: @unchecked Sendable {
 
     /// 녹음을 즉시 취소한다 — 오디오/소켓을 모두 폐기하고 변환 없이 idle로 복귀.
     /// RT/Async 모드 모두 동일하게 동작: 어떤 텍스트도 붙여넣지 않는다.
+    @MainActor
     public func cancelRecording() async {
-        guard appState.status == .recording else { return }
+        guard appState.status == .recording, !discardFinalizedSegments else { return }
         stopRequested = true
+        discardFinalizedSegments = true
+        defer { discardFinalizedSegments = false }
 
         // 1. 마이크/녹음 중지 후 파일 즉시 삭제
         do {
@@ -115,6 +124,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
         appState.partialTranscription = nil
         appState.pendingCopyText = nil
         appState.focusLost = false
+        appState.isAwaitingPendingPaste = false
         appState.stopRecording()
         appState.status = .idle
         onStatusChange?(.idle)
@@ -124,6 +134,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
 
     public func retryLastTranscription() async {
         guard let audioURL = appState.lastAudioFileURL else { return }
+        startingAppBundleId = frontmostAppBundleId()
         appState.status = .transcribing
         onStatusChange?(.transcribing)
         await transcribeAndPaste(audioURL: audioURL)
@@ -151,7 +162,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
         try? await Task.sleep(for: startDelay)
 
         let focusDetector = FocusDetector()
-        startingAppBundleId = focusDetector.frontmostAppBundleId()
+        startingAppBundleId = frontmostAppBundleId()
         appState.startingAppName = focusDetector.frontmostAppName()
         appState.startRecording()
         onStatusChange?(.recording)
@@ -189,39 +200,12 @@ public final class RecordingCoordinator: @unchecked Sendable {
                     model: model(),
                     onPartialResult: { [weak self] partialText in
                         Task { @MainActor [weak self] in
-                            withAnimation(.interpolatingSpring(stiffness: 170, damping: 15)) {
-                                self?.appState.partialTranscription = partialText
-                            }
+                            self?.appState.partialTranscription = partialText
                         }
                     },
                     onSegmentFinalized: { [weak self] (confirmedText: String) in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            let focusDetector = FocusDetector()
-                            let hasFocus = focusDetector.hasTextInputFocus()
-                            let appName = focusDetector.frontmostAppName() ?? "unknown"
-                            print("[RT Pipeline] 포커스: \(hasFocus), 앱: \(appName)")
-
-                            if hasFocus {
-                                print("[RT Pipeline] 붙여넣기: \(confirmedText.prefix(50))")
-                                let result = await self.textInjector.pasteText(confirmedText)
-                                if result == .needsAccessibilityPermission {
-                                    print("[RT Pipeline] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
-                                    self.onError?(.accessibilityPermissionDenied)
-                                    let prev = self.appState.pendingCopyText ?? ""
-                                    self.appState.pendingCopyText = prev + confirmedText
-                                }
-                            } else {
-                                print("[RT Pipeline] 포커스 없음, 오버레이에만 표시")
-                                withAnimation(.interpolatingSpring(stiffness: 170, damping: 15)) {
-                                    let prev = self.appState.pendingCopyText ?? ""
-                                    self.appState.pendingCopyText = prev + confirmedText
-                                }
-                            }
-                            withAnimation(.interpolatingSpring(stiffness: 170, damping: 15)) {
-                                self.appState.partialTranscription = nil
-                            }
-                        }
+                        guard let self else { return }
+                        await self.handleFinalizedSegment(confirmedText)
                     }
                 )
 
@@ -273,7 +257,6 @@ public final class RecordingCoordinator: @unchecked Sendable {
             focusObserver?.cancel()
             focusObserver = nil
             stopMeteringTimer()
-            appState.focusLost = false
             soundService.play(.recordingStopped)
 
             // RT 모드 초기화 중 취소: 변환 스킵, 즉시 idle 복귀
@@ -314,15 +297,19 @@ public final class RecordingCoordinator: @unchecked Sendable {
             // (소켓이 이미 끊긴 경우 finishStreaming이 즉시 반환되어 Thinking이 안 보이는 문제 방지)
             try? await Task.sleep(for: .milliseconds(300))
             let remainingText = try await streamingClient.finishStreaming()
-            // 남은 텍스트가 있으면 마저 붙여넣기
-            if !remainingText.isEmpty {
-                print("[RT Pipeline] 남은 텍스트 붙여넣기: \(remainingText.prefix(50))...")
-                let result = await textInjector.pasteText(remainingText)
-                if result == .needsAccessibilityPermission {
-                    print("[RT Pipeline] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
-                    onError?(.accessibilityPermissionDenied)
-                    let prev = appState.pendingCopyText ?? ""
-                    appState.pendingCopyText = prev + remainingText
+            let textToPaste = (appState.pendingCopyText ?? "") + remainingText
+            // 대기 중인 텍스트와 남은 텍스트를 발화 순서대로 한 번에 붙여넣기
+            if !textToPaste.isEmpty {
+                if appState.focusLost || !isOriginalAppFrontmost {
+                    print("[RT Pipeline] 포커스 이탈 상태에서 종료 — 클립보드에 보존")
+                    textInjector.copyText(textToPaste)
+                } else {
+                    print("[RT Pipeline] 미전달 텍스트 붙여넣기: \(textToPaste.prefix(50))...")
+                    let result = await textInjector.pasteText(textToPaste)
+                    if result == .needsAccessibilityPermission {
+                        print("[RT Pipeline] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
+                        onError?(.accessibilityPermissionDenied)
+                    }
                 }
             } else {
                 print("[RT Pipeline] 실시간 변환 완료 (모든 텍스트 이미 전달됨)")
@@ -338,6 +325,80 @@ public final class RecordingCoordinator: @unchecked Sendable {
 
     // MARK: - 포커스 모니터링
 
+    @MainActor
+    private func handleFinalizedSegment(_ confirmedText: String) async {
+        guard !discardFinalizedSegments else {
+            appState.partialTranscription = nil
+            return
+        }
+
+        if appState.focusLost || appState.isAwaitingPendingPaste || !isOriginalAppFrontmost {
+            print("[RT Pipeline] 포커스 대기 중, 오버레이 버퍼에 저장")
+            appendPendingText(confirmedText)
+            if !isOriginalAppFrontmost {
+                handleFocusChange(isOriginalAppActive: false)
+            }
+        } else {
+            print("[RT Pipeline] 붙여넣기: \(confirmedText.prefix(50))")
+            let result = await textInjector.pasteText(confirmedText)
+            if result == .needsAccessibilityPermission {
+                print("[RT Pipeline] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
+                onError?(.accessibilityPermissionDenied)
+                appendPendingText(confirmedText)
+            }
+        }
+        appState.partialTranscription = nil
+    }
+
+    @MainActor
+    func handleFocusChange(isOriginalAppActive: Bool) {
+        guard appState.status == .recording else { return }
+
+        if isOriginalAppActive {
+            if appState.focusLost {
+                print("[Focus] 원래 앱으로 포커스 복귀")
+            }
+            appState.focusLost = false
+            appState.isAwaitingPendingPaste = appState.pendingCopyText?.isEmpty == false
+        } else {
+            if !appState.focusLost {
+                print("[Focus] 원래 앱에서 포커스 이탈")
+            }
+            appState.focusLost = true
+            appState.isAwaitingPendingPaste = false
+        }
+    }
+
+    @MainActor
+    public func pastePendingTranscription() async {
+        guard appState.status == .recording,
+              appState.isAwaitingPendingPaste,
+              !pendingPasteInProgress,
+              let pendingText = appState.pendingCopyText,
+              !pendingText.isEmpty else { return }
+
+        guard isOriginalAppFrontmost else {
+            handleFocusChange(isOriginalAppActive: false)
+            return
+        }
+
+        pendingPasteInProgress = true
+        defer { pendingPasteInProgress = false }
+
+        let result = await textInjector.pasteText(pendingText)
+        if result == .needsAccessibilityPermission {
+            onError?(.accessibilityPermissionDenied)
+            return
+        }
+
+        let currentText = appState.pendingCopyText ?? ""
+        if currentText.hasPrefix(pendingText) {
+            let remainingText = String(currentText.dropFirst(pendingText.count))
+            appState.pendingCopyText = remainingText.isEmpty ? nil : remainingText
+        }
+        appState.isAwaitingPendingPaste = appState.pendingCopyText?.isEmpty == false
+    }
+
     private func startFocusMonitoring() {
         focusObserver?.cancel()
         focusObserver = Task { @MainActor [weak self] in
@@ -349,19 +410,9 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { continue }
                 let activeBundleId = app.bundleIdentifier
                 if activeBundleId == self.startingAppBundleId {
-                    // 포커스 복귀
-                    if self.appState.focusLost {
-                        print("[Focus] 포커스 복귀: \(app.localizedName ?? "unknown")")
-                        self.appState.focusLost = false
-                        await self.activeStreamingClient?.resumeStreaming()
-                    }
+                    self.handleFocusChange(isOriginalAppActive: true)
                 } else if activeBundleId != Bundle.main.bundleIdentifier {
-                    // 포커스 이탈
-                    if !self.appState.focusLost {
-                        print("[Focus] 포커스 이탈: \(app.localizedName ?? "unknown")")
-                        self.appState.focusLost = true
-                        await self.activeStreamingClient?.pauseStreaming()
-                    }
+                    self.handleFocusChange(isOriginalAppActive: false)
                 }
             }
         }
@@ -388,6 +439,16 @@ public final class RecordingCoordinator: @unchecked Sendable {
     private func stopMeteringTimer() {
         meteringTimer?.cancel()
         meteringTimer = nil
+    }
+
+    private func appendPendingText(_ text: String) {
+        guard !text.isEmpty else { return }
+        appState.pendingCopyText = (appState.pendingCopyText ?? "") + text
+    }
+
+    private var isOriginalAppFrontmost: Bool {
+        guard let startingAppBundleId else { return false }
+        return frontmostAppBundleId() == startingAppBundleId
     }
 
     // MARK: - 파일 기반 변환 (기존 로직)
@@ -418,8 +479,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 print("[Async] 폴리시: \"\(before.prefix(50))\" → \"\(text.prefix(50))\"")
             }
             // 포커스 확인 후 붙여넣기
-            let focusDetector = FocusDetector()
-            if focusDetector.hasTextInputFocus() {
+            if isOriginalAppFrontmost {
                 let result = await textInjector.pasteText(text)
                 if result == .needsAccessibilityPermission {
                     print("[Async] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")

@@ -67,7 +67,7 @@ public final class FocusDetector: Sendable {
     @discardableResult
     public func activateApp(bundleId: String) -> Bool {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else { return false }
-        return app.activate(options: [.activateIgnoringOtherApps])
+        return app.activate(options: [])
     }
 
     private func inferDomain(bundleId: String) -> AppDomainContext? {

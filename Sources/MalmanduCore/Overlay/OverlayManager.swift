@@ -15,6 +15,7 @@ public final class OverlayManager {
     public var onFocusStop: (() -> Void)?
     public var onCancel: (() -> Void)?
     public var onConfirm: (() -> Void)?
+    public var onPastePending: (() -> Void)?
 
     public init() {}
 
@@ -153,7 +154,8 @@ public final class OverlayManager {
             onFocusContinue: onFocusContinue,
             onFocusStop: onFocusStop,
             onCancel: onCancel,
-            onConfirm: onConfirm
+            onConfirm: onConfirm,
+            onPastePending: onPastePending
         )
         let hv = ClickThroughHostingView(rootView: rootView)
         panel.contentView = hv

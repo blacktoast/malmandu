@@ -11,6 +11,7 @@ struct OverlayRootView: View {
     var onFocusStop: (() -> Void)?
     var onCancel: (() -> Void)?
     var onConfirm: (() -> Void)?
+    var onPastePending: (() -> Void)?
 
     /// 노치 transition 발동 단일 진실 — 모든 변화는 withAnimation으로 명시 제어
     @State private var isVisible = false
@@ -60,7 +61,8 @@ struct OverlayRootView: View {
                 onContinue: onFocusContinue,
                 onStop: onFocusStop,
                 onCancel: onCancel,
-                onConfirm: onConfirm
+                onConfirm: onConfirm,
+                onPastePending: onPastePending
             )
             .transition(.blurReplace(.downUp))
         }

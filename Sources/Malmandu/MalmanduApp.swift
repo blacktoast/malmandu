@@ -205,6 +205,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             Task { await self.coordinator.toggleRecording() }
         }
+
+        overlayManager.onPastePending = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                await self.coordinator.pastePendingTranscription()
+            }
+        }
     }
 
     // MARK: - Modifier-only 단축키 감지

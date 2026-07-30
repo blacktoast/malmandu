@@ -11,4 +11,5 @@ public enum PasteResult: Sendable, Equatable {
 /// 텍스트 주입 서비스 프로토콜
 public protocol TextInjectorProtocol: Sendable {
     func pasteText(_ text: String) async -> PasteResult
+    func copyText(_ text: String)
 }

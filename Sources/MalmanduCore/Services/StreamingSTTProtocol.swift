@@ -4,7 +4,7 @@ import Foundation
 public typealias PartialResultHandler = @Sendable (String) -> Void
 
 /// 세그먼트 확정 콜백 (즉시 텍스트 붙여넣기용)
-public typealias SegmentFinalizedHandler = @Sendable (String) -> Void
+public typealias SegmentFinalizedHandler = @Sendable (String) async -> Void
 
 /// 실시간 스트리밍 STT 프로토콜
 public protocol StreamingSTTServiceProtocol: Sendable {

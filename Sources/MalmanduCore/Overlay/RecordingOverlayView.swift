@@ -8,6 +8,7 @@ public struct RecordingOverlayView: View {
     var onStop: (() -> Void)?
     var onCancel: (() -> Void)?
     var onConfirm: (() -> Void)?
+    var onPastePending: (() -> Void)?
 
     @State private var rtTextHeight: CGFloat = 0
     private let rtTextMaxHeight: CGFloat = 80
@@ -18,7 +19,8 @@ public struct RecordingOverlayView: View {
         onContinue: (() -> Void)? = nil,
         onStop: (() -> Void)? = nil,
         onCancel: (() -> Void)? = nil,
-        onConfirm: (() -> Void)? = nil
+        onConfirm: (() -> Void)? = nil,
+        onPastePending: (() -> Void)? = nil
     ) {
         self.appState = appState
         self.isRealtimeMode = isRealtimeMode
@@ -26,11 +28,14 @@ public struct RecordingOverlayView: View {
         self.onStop = onStop
         self.onCancel = onCancel
         self.onConfirm = onConfirm
+        self.onPastePending = onPastePending
     }
 
     public var body: some View {
         if appState.focusLost {
             focusLostView
+        } else if appState.isAwaitingPendingPaste {
+            pendingPasteView
         } else if isRealtimeMode {
             rtModeView
         } else {
@@ -136,6 +141,42 @@ public struct RecordingOverlayView: View {
         return parts.isEmpty ? nil : parts.joined()
     }
 
+    private var pendingPasteView: some View {
+        VStack(spacing: 6) {
+            VStack(spacing: 8) {
+                Text("붙여넣을까요?")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Color.overlayText)
+
+                ScrollView {
+                    Text(appState.pendingCopyText ?? "")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.overlayText.opacity(0.9))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxHeight: 48)
+
+                Button(action: { onPastePending?() }) {
+                    Text("붙여넣기")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.manduPurple))
+                        .foregroundColor(.white)
+                }
+                .buttonStyle(.plain)
+            }
+            .frame(width: 200)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 24).fill(Color.overlayBackground.opacity(0.94)))
+
+            ActionButtonsPillView(onCancel: onCancel, onConfirm: onConfirm)
+        }
+    }
+
     private var focusLostView: some View {
         VStack(spacing: 10) {
             HStack(spacing: 8) {
@@ -176,13 +217,7 @@ public struct RecordingOverlayView: View {
                 }
                 .buttonStyle(.plain)
 
-                Button(action: {
-                    if let pendingText = appState.pendingCopyText, !pendingText.isEmpty {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(pendingText, forType: .string)
-                    }
-                    onStop?()
-                }) {
+                Button(action: { onStop?() }) {
                     Text("종료")
                         .font(.system(size: 12, weight: .medium))
                         .padding(.horizontal, 20)
