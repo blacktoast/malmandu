@@ -3,6 +3,44 @@ import AudioToolbox
 import CoreAudio
 import Foundation
 
+final class SystemVolumeDucker: @unchecked Sendable {
+    typealias ReadVolume = () -> (deviceID: AudioDeviceID, volume: Float)?
+    typealias WriteVolume = (AudioDeviceID, Float) -> Bool
+
+    private let readVolume: ReadVolume
+    private let writeVolume: WriteVolume
+    private let lock = NSLock()
+    private var saved: (deviceID: AudioDeviceID, volume: Float)?
+
+    init(readVolume: @escaping ReadVolume, writeVolume: @escaping WriteVolume) {
+        self.readVolume = readVolume
+        self.writeVolume = writeVolume
+    }
+
+    func duck() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard saved == nil, let current = readVolume(),
+              writeVolume(current.deviceID, current.volume * 0.15) else { return }
+        saved = current
+    }
+
+    @discardableResult
+    func restore() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let saved else { return true }
+        // ponytail: bounded sync retries; add a device listener only if detached outputs still strand volume.
+        for _ in 0..<3 {
+            if writeVolume(saved.deviceID, saved.volume) {
+                self.saved = nil
+                return true
+            }
+        }
+        return false
+    }
+}
+
 /// AVAudioRecorder/AVAudioEngine 기반 녹음 서비스
 public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Sendable {
     private var recorder: AVAudioRecorder?
@@ -10,11 +48,14 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
     private var recordingURL: URL?
     private var isStreamingMode = false
     private let maxDuration: TimeInterval
-    private var savedVolume: Float = 1.0
-    private var volumeDucked = false
+    private let systemVolumeDucker: SystemVolumeDucker
 
     public init(maxDuration: TimeInterval = 300) { // 5분 기본
         self.maxDuration = maxDuration
+        self.systemVolumeDucker = SystemVolumeDucker(
+            readVolume: Self.getSystemVolume,
+            writeVolume: Self.setSystemVolume
+        )
         super.init()
     }
 
@@ -163,16 +204,13 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
     // MARK: - Private
 
     private func duckSystemVolume() {
-        guard !volumeDucked, let vol = getSystemVolume() else { return }
-        savedVolume = vol
-        setSystemVolume(vol * 0.15)
-        volumeDucked = true
+        systemVolumeDucker.duck()
     }
 
     private func restoreSystemVolume() {
-        guard volumeDucked else { return }
-        volumeDucked = false
-        setSystemVolume(savedVolume)
+        if !systemVolumeDucker.restore() {
+            print("[AudioRecorder] 시스템 볼륨 복원 실패")
+        }
     }
 
     private func makeRecordingURL() -> URL {
@@ -212,7 +250,7 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
 
     // MARK: - CoreAudio 볼륨 제어
 
-    private func defaultOutputDevice() -> AudioDeviceID? {
+    private static func defaultOutputDevice() -> AudioDeviceID? {
         var deviceID = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         var address = AudioObjectPropertyAddress(
@@ -224,7 +262,7 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
         return err == noErr && deviceID != kAudioObjectUnknown ? deviceID : nil
     }
 
-    private func getSystemVolume() -> Float? {
+    private static func getSystemVolume() -> (deviceID: AudioDeviceID, volume: Float)? {
         guard let deviceID = defaultOutputDevice() else { return nil }
         var volume = Float32(0)
         var size = UInt32(MemoryLayout<Float32>.size)
@@ -234,11 +272,10 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
             mElement: kAudioObjectPropertyElementMain
         )
         let err = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &volume)
-        return err == noErr ? Float(volume) : nil
+        return err == noErr ? (deviceID, Float(volume)) : nil
     }
 
-    private func setSystemVolume(_ newVolume: Float) {
-        guard let deviceID = defaultOutputDevice() else { return }
+    private static func setSystemVolume(_ deviceID: AudioDeviceID, _ newVolume: Float) -> Bool {
         var value = min(max(0, Float32(newVolume)), 1)
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
@@ -246,6 +283,6 @@ public final class AudioRecorder: NSObject, AudioRecorderProtocol, @unchecked Se
             mElement: kAudioObjectPropertyElementMain
         )
         let size = UInt32(MemoryLayout<Float32>.size)
-        AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &value)
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &value) == noErr
     }
 }
