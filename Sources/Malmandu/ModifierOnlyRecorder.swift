@@ -110,14 +110,39 @@ private struct UnifiedRecorderRepresentable: NSViewRepresentable {
 }
 
 final class UnifiedRecorderNSView: NSView {
+    typealias KeyStateProvider = (CGKeyCode) -> Bool
+
     var onCaptureKeyed: ((UInt16, NSEvent.ModifierFlags) -> Void)?
     var onCaptureModifierOnly: ((NSEvent.ModifierFlags) -> Void)?
     var onFocusChange: ((Bool) -> Void)?
 
+    private static let modifierKeyCodes: Set<CGKeyCode> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+
+    private let isKeyPressed: KeyStateProvider
     private var pendingFlags: NSEvent.ModifierFlags = []
+    private var currentFlags: NSEvent.ModifierFlags = []
+    private var pressedKeyCodes: Set<CGKeyCode> = []
+    private var polledCandidate: CGKeyCode?
+    private var polledCandidateModifiers: NSEvent.ModifierFlags = []
+    private var polledCandidateTicks: Int = 0
     private var keyDownHappened: Bool = false
     private var eventMonitor: Any?
+    private var keyStateTimer: Timer?
     private var isActive: Bool = false
+
+    init(
+        isKeyPressed: @escaping KeyStateProvider = {
+            CGEventSource.keyState(.combinedSessionState, key: $0)
+        }
+    ) {
+        self.isKeyPressed = isKeyPressed
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     // 클릭 전엔 first responder가 되지 않도록 거부 — 자동 포커스 방지
     override var acceptsFirstResponder: Bool { false }
@@ -131,6 +156,10 @@ final class UnifiedRecorderNSView: NSView {
         guard !isActive else { return }
         isActive = true
         pendingFlags = []
+        currentFlags = []
+        polledCandidate = nil
+        polledCandidateModifiers = []
+        polledCandidateTicks = 0
         keyDownHappened = false
         onFocusChange?(true)
 
@@ -139,14 +168,7 @@ final class UnifiedRecorderNSView: NSView {
             guard let self, self.isActive else { return event }
             switch event.type {
             case .keyDown:
-                if event.keyCode == 53 {  // Escape — 취소
-                    self.deactivate()
-                    return nil
-                }
-                self.keyDownHappened = true
-                let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                self.onCaptureKeyed?(event.keyCode, mods)
-                self.deactivate()
+                self.handleKeyDown(event)
                 return nil
             case .flagsChanged:
                 self.handleFlags(event)
@@ -155,27 +177,115 @@ final class UnifiedRecorderNSView: NSView {
                 return event
             }
         }
+        pressedKeyCodes = currentPressedKeyCodes()
+        // ponytail: 4틱(약 25ms) 확인으로 새 권한과 로컬 keyDown 경합을 피한다. 더 짧은 입력이 필요할 때만 이벤트 탭 권한을 추가한다.
+        let timer = Timer(
+            timeInterval: 1.0 / 120.0,
+            target: self,
+            selector: #selector(pollPressedKeysFromTimer),
+            userInfo: nil,
+            repeats: true
+        )
+        keyStateTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func deactivate() {
         guard isActive else { return }
         isActive = false
         pendingFlags = []
+        currentFlags = []
+        pressedKeyCodes = []
+        polledCandidate = nil
+        polledCandidateModifiers = []
+        polledCandidateTicks = 0
         keyDownHappened = false
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
         }
+        keyStateTimer?.invalidate()
+        keyStateTimer = nil
         onFocusChange?(false)
+    }
+
+    func pollPressedKeys() {
+        guard isActive else { return }
+        if let window, !NSApp.isActive || !window.isKeyWindow {
+            deactivate()
+            return
+        }
+        let current = currentPressedKeyCodes()
+        let newlyPressed = current.subtracting(pressedKeyCodes)
+        pressedKeyCodes = current
+
+        if let polledCandidate {
+            guard current.contains(polledCandidate) else {
+                self.polledCandidate = nil
+                polledCandidateModifiers = []
+                polledCandidateTicks = 0
+                if currentFlags.isEmpty {
+                    deactivate()
+                }
+                return
+            }
+            polledCandidateTicks += 1
+            guard polledCandidateTicks >= 4 else { return }
+            handleKeyDown(
+                keyCode: polledCandidate,
+                modifiers: polledCandidateModifiers
+            )
+            return
+        }
+
+        guard let keyCode = newlyPressed.min() else { return }
+        polledCandidate = keyCode
+        polledCandidateModifiers = currentFlags.union(NSEvent.modifierFlags)
+        polledCandidateTicks = 1
+        keyDownHappened = true
+    }
+
+    @objc private func pollPressedKeysFromTimer() {
+        pollPressedKeys()
+    }
+
+    private func currentPressedKeyCodes() -> Set<CGKeyCode> {
+        Set((0...127).compactMap { rawValue in
+            let keyCode = CGKeyCode(rawValue)
+            guard !Self.modifierKeyCodes.contains(keyCode), isKeyPressed(keyCode) else {
+                return nil
+            }
+            return keyCode
+        })
+    }
+
+    private func handleKeyDown(_ event: NSEvent) {
+        handleKeyDown(keyCode: event.keyCode, modifiers: event.modifierFlags)
+    }
+
+    private func handleKeyDown(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) {
+        guard isActive else { return }
+        if keyCode == 53 {  // Escape — 취소
+            deactivate()
+            return
+        }
+        keyDownHappened = true
+        let mods = modifiers.intersection(.deviceIndependentFlagsMask)
+        onCaptureKeyed?(keyCode, mods)
+        deactivate()
     }
 
     private func handleFlags(_ event: NSEvent) {
         let current = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        currentFlags = current
         if current.rawValue != 0 {
             if current.rawValue.nonzeroBitCount >= pendingFlags.rawValue.nonzeroBitCount {
                 pendingFlags = current
             }
         } else {
+            if polledCandidate != nil {
+                return
+            }
             if !keyDownHappened, !pendingFlags.isEmpty {
                 let captured = pendingFlags
                 onCaptureModifierOnly?(captured)

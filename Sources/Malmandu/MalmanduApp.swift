@@ -52,6 +52,36 @@ struct MalmanduApp: App {
     }()
 }
 
+struct SpaceShortcutPollState {
+    private var wasSpacePressed = false
+    private var isArmed = false
+
+    mutating func reset(isSpacePressed: Bool) {
+        wasSpacePressed = isSpacePressed
+        isArmed = false
+    }
+
+    mutating func update(
+        isSpacePressed: Bool,
+        modifiers: NSEvent.ModifierFlags,
+        targetModifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+
+        if isSpacePressed, !wasSpacePressed {
+            isArmed = modifiers.intersection(relevantModifiers)
+                == targetModifiers.intersection(relevantModifiers)
+        }
+
+        let shouldTrigger = !isSpacePressed && wasSpacePressed && isArmed
+        if !isSpacePressed {
+            isArmed = false
+        }
+        wasSpacePressed = isSpacePressed
+        return shouldTrigger
+    }
+}
+
 // MARK: - AppDelegate
 
 @MainActor
@@ -68,6 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var modifierMonitorGlobal: Any?
     private var modifierMonitorLocal: Any?
     private var lastModifierFlags: NSEvent.ModifierFlags = []
+    private var spaceShortcutTimer: Timer?
+    private var spaceShortcutModifiers: NSEvent.ModifierFlags?
+    private var spaceShortcutState = SpaceShortcutPollState()
 
     override init() {
         super.init()
@@ -157,11 +190,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 키보드 단축키 핸들러 등록
         KeyboardShortcuts.onKeyUp(for: .toggleRecording) { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.coordinator.toggleRecording()
-                self.overlayManager.handleStatusChange(self.appState.status)
+                await self?.toggleRecordingFromShortcut()
             }
         }
+        setupSpaceShortcutMonitor()
 
         // Modifier-only 단축키 감지 등록 (Fn 등)
         setupModifierOnlyMonitor()
@@ -212,6 +244,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await self.coordinator.pastePendingTranscription()
             }
         }
+    }
+
+    private func setupSpaceShortcutMonitor() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(shortcutDefaultsDidChange(_:)),
+            name: UserDefaults.didChangeNotification,
+            object: nil
+        )
+        refreshSpaceShortcut()
+    }
+
+    @objc private func shortcutDefaultsDidChange(_ notification: Notification) {
+        refreshSpaceShortcut()
+    }
+
+    private func refreshSpaceShortcut() {
+        let shortcut = KeyboardShortcuts.getShortcut(for: .toggleRecording)
+        let newModifiers = shortcut?.carbonKeyCode == 49 ? shortcut?.modifiers : nil
+
+        if newModifiers == spaceShortcutModifiers,
+           newModifiers == nil || !KeyboardShortcuts.isEnabled(for: .toggleRecording) {
+            return
+        }
+
+        if spaceShortcutModifiers != nil, newModifiers == nil {
+            KeyboardShortcuts.enable(.toggleRecording)
+        }
+
+        spaceShortcutModifiers = newModifiers
+        spaceShortcutState.reset(
+            isSpacePressed: CGEventSource.keyState(.combinedSessionState, key: 49)
+        )
+
+        guard newModifiers != nil else {
+            spaceShortcutTimer?.invalidate()
+            spaceShortcutTimer = nil
+            return
+        }
+
+        KeyboardShortcuts.disable(.toggleRecording)
+        guard spaceShortcutTimer == nil else { return }
+
+        let timer = Timer(
+            timeInterval: 1.0 / 120.0,
+            target: self,
+            selector: #selector(pollSpaceShortcut),
+            userInfo: nil,
+            repeats: true
+        )
+        spaceShortcutTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func pollSpaceShortcut() {
+        guard let targetModifiers = spaceShortcutModifiers else { return }
+
+        let isSpacePressed = CGEventSource.keyState(.combinedSessionState, key: 49)
+        let shouldTrigger = spaceShortcutState.update(
+            isSpacePressed: isSpacePressed,
+            modifiers: NSEvent.modifierFlags,
+            targetModifiers: targetModifiers
+        )
+        guard shouldTrigger else { return }
+
+        Task { @MainActor [weak self] in
+            await self?.toggleRecordingFromShortcut()
+        }
+    }
+
+    private func toggleRecordingFromShortcut() async {
+        await coordinator.toggleRecording()
+        overlayManager.handleStatusChange(appState.status)
     }
 
     // MARK: - Modifier-only 단축키 감지
