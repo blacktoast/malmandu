@@ -26,7 +26,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MalmanduCoreTests",
-            dependencies: ["MalmanduCore"],
+            dependencies: ["MalmanduCore", "Malmandu"],
             path: "Tests/MalmanduCoreTests"
         ),
     ]
