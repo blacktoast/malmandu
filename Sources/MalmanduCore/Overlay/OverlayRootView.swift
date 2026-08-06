@@ -17,7 +17,7 @@ struct OverlayRootView: View {
     @State private var isVisible = false
 
     private var shouldShow: Bool {
-        appState.status == .recording || appState.status == .transcribing
+        appState.overlayPresentation != .hidden
     }
 
     var body: some View {
@@ -40,7 +40,7 @@ struct OverlayRootView: View {
                 }
             }
         }
-        .onChange(of: appState.status) { _, _ in
+        .onChange(of: appState.overlayPresentation) { _, _ in
             let target = shouldShow
             if target != isVisible {
                 withAnimation(.easeInOut(duration: 0.3)) {

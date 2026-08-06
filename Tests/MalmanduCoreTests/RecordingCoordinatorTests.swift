@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import MalmanduCore
 
+@MainActor
 @Suite("RecordingCoordinator Tests")
 struct RecordingCoordinatorTests {
 
@@ -13,7 +14,9 @@ struct RecordingCoordinatorTests {
         stopRecordingURL: URL = URL(fileURLWithPath: "/tmp/test.m4a"),
         transcribeError: Error? = nil,
         transcribeResult: String = "hello world",
-        streamingClient: MockStreamingSTTClient? = nil
+        streamingClient: MockStreamingSTTClient? = nil,
+        startDelay: Duration = .zero,
+        frontmostAppBundleId: @escaping @Sendable () -> String? = { "original.app" }
     ) -> (
         coordinator: RecordingCoordinator,
         appState: AppState,
@@ -40,9 +43,10 @@ struct RecordingCoordinatorTests {
             textInjector: textInjector,
             soundService: soundService,
             model: { streamingClient != nil ? "stt-rt-v1" : "whisper-large-v3" },
-            startDelay: .zero,
+            startDelay: startDelay,
             audioProcessor: MockAudioProcessor(),
-            streamingClientProvider: { streamingClient }
+            streamingClientProvider: { streamingClient },
+            frontmostAppBundleId: frontmostAppBundleId
         )
 
         return (coordinator, appState, recorder, apiClient, textInjector, soundService)
@@ -67,7 +71,8 @@ struct RecordingCoordinatorTests {
     @Test("toggleRecording: error 상태에서 호출하면 recording을 시작한다")
     func toggleRecordingFromErrorStartsRecording() async {
         let (coordinator, appState, recorder, _, _, _) = makeSUT()
-        appState.fail(with: .apiKeyMissing)
+        let sessionID = reducerSessionID(appState)
+        _ = appState.send(.startFailed(sessionID: sessionID, .apiKeyMissing))
         #expect(appState.status == .error)
 
         await coordinator.toggleRecording()
@@ -94,16 +99,44 @@ struct RecordingCoordinatorTests {
         #expect(textInjector.lastPastedText == "안녕하세요")
     }
 
+    @Test("toggleRecording: starting 중 종료하면 캡처 없이 idle로 복귀한다")
+    func toggleRecordingWhileStartingStopsCleanly() async {
+        let (coordinator, appState, recorder, apiClient, _, _) = makeSUT(
+            startDelay: .milliseconds(50)
+        )
+
+        let startTask = Task { await coordinator.toggleRecording() }
+        for _ in 0..<100 {
+            if appState.overlayPresentation == .starting {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(appState.overlayPresentation == .starting)
+
+        await coordinator.toggleRecording()
+        #expect(appState.overlayPresentation == .transcribing)
+
+        await startTask.value
+
+        #expect(appState.status == .idle)
+        #expect(recorder.startRecordingCalled == false)
+        #expect(apiClient.transcribeCalled == false)
+    }
+
     // MARK: - Test 3: transcribing 상태에서는 무시
 
     @Test("toggleRecording: transcribing 상태에서 호출하면 아무것도 하지 않는다")
     func toggleRecordingFromTranscribingDoesNothing() async {
         let (coordinator, appState, recorder, apiClient, _, _) = makeSUT()
 
-        // 수동으로 transcribing 상태로 설정
-        appState.stopRecording() // idle → transcribing (via startRecording → stopRecording)
-        // 실제로는 startRecording 없이 직접 transcribing으로
-        appState.status = .transcribing
+        let sessionID = reducerSessionID(appState)
+        _ = appState.send(.startSucceeded(sessionID: sessionID))
+        _ = appState.send(.stopRequested)
+        _ = appState.send(.captureStopped(
+            sessionID: sessionID,
+            URL(fileURLWithPath: "/tmp/transcribing.m4a")
+        ))
 
         let recorderCalledBefore = recorder.startRecordingCalled
         let apiCalledBefore = apiClient.transcribeCalled
@@ -143,6 +176,23 @@ struct RecordingCoordinatorTests {
         // 효과음: recordingStarted, recordingStopped
         #expect(soundService.playedEvents.contains(.recordingStarted))
         #expect(soundService.playedEvents.contains(.recordingStopped))
+    }
+
+    @Test("파일 변환 완료 시 원래 앱이 아니면 클립보드에 보존한다")
+    func fileTranscriptionCopiesWhenFocusMoved() async {
+        let focus = CoordinatorFocusProvider()
+        let (coordinator, appState, _, _, textInjector, _) = makeSUT(
+            transcribeResult: "보존할 텍스트",
+            frontmostAppBundleId: { focus.bundleIdentifier }
+        )
+
+        await coordinator.toggleRecording()
+        focus.bundleIdentifier = "other.app"
+        await coordinator.toggleRecording()
+
+        #expect(textInjector.pasteTextCalled == false)
+        #expect(textInjector.lastCopiedText == "보존할 텍스트")
+        #expect(appState.status == .idle)
     }
 
     // MARK: - Test 5: 전사 실패 시 에러 상태 및 audioURL 보존
@@ -199,8 +249,15 @@ struct RecordingCoordinatorTests {
             transcribeResult: "retry result"
         )
 
-        // 에러 상태에서 audioURL 보존
-        appState.fail(with: .transcriptionFailed("first attempt"), audioURL: audioURL)
+        let sessionID = reducerSessionID(appState)
+        _ = appState.send(.startSucceeded(sessionID: sessionID))
+        _ = appState.send(.stopRequested)
+        _ = appState.send(.captureStopped(sessionID: sessionID, audioURL))
+        _ = appState.send(.transcriptionFailed(
+            sessionID: sessionID,
+            .transcriptionFailed("first attempt"),
+            audioURL: audioURL
+        ))
 
         await coordinator.retryLastTranscription()
 
@@ -294,6 +351,24 @@ struct RecordingCoordinatorTests {
         } else {
             Issue.record("Expected recordingFailed error")
         }
+    }
+
+    @Test("RT stop 실패도 streaming client를 닫는다")
+    func stopRecordingErrorClosesStreamingClient() async {
+        struct StopError: Error, LocalizedError {
+            var errorDescription: String? { "stop failed" }
+        }
+        let streamingClient = MockStreamingSTTClient()
+        let (coordinator, appState, _, _, _, _) = makeSUT(
+            stopRecordingError: StopError(),
+            streamingClient: streamingClient
+        )
+
+        await coordinator.toggleRecording()
+        await coordinator.toggleRecording()
+
+        #expect(streamingClient.finishStreamingCalled)
+        #expect(appState.status == .error)
     }
 
     // MARK: - RT 모드 테스트
@@ -408,8 +483,20 @@ struct RecordingCoordinatorTests {
         let (coordinator, appState, _, _, _, _) = makeSUT(streamingClient: streamingClient)
 
         await coordinator.toggleRecording()
-        appState.pendingCopyText = "이전 부분 텍스트"
-        appState.partialTranscription = "스트리밍 중인 텍스트"
+        guard let sessionID = appState.currentSessionID else {
+            Issue.record("Expected active session")
+            return
+        }
+        _ = appState.send(.focusChanged(sessionID: sessionID, isTargetActive: false))
+        _ = appState.send(.segmentFinalized(
+            sessionID: sessionID,
+            text: "이전 부분 텍스트",
+            isTargetActive: false
+        ))
+        _ = appState.send(.partialUpdated(
+            sessionID: sessionID,
+            text: "스트리밍 중인 텍스트"
+        ))
 
         await coordinator.cancelRecording()
 
@@ -417,4 +504,19 @@ struct RecordingCoordinatorTests {
         #expect(appState.partialTranscription == nil)
         #expect(appState.status == .idle)
     }
+
+    private func reducerSessionID(_ appState: AppState) -> UUID {
+        let effects = appState.send(.toggleRequested(
+            targetBundleIdentifier: nil,
+            targetName: nil
+        ))
+        guard case .startCapture(let sessionID)? = effects.first else {
+            preconditionFailure("Expected startCapture effect")
+        }
+        return sessionID
+    }
+}
+
+private final class CoordinatorFocusProvider: @unchecked Sendable {
+    var bundleIdentifier: String? = "original.app"
 }

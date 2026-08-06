@@ -5,6 +5,26 @@ import Testing
 
 @Suite("RecordingOverlayView layout tests", .serialized)
 struct RecordingOverlayViewLayoutTests {
+    @Test("real-time chrome remains visible while starting and stopping")
+    @MainActor
+    func realtimeChromeSurvivesTransitionStates() {
+        let state = AppState()
+        let effects = state.send(.toggleRequested(targetBundleIdentifier: nil, targetName: nil))
+        guard case .startCapture(let sessionID)? = effects.first else {
+            Issue.record("Expected startCapture effect")
+            return
+        }
+
+        #expect(RecordingOverlayView(appState: state, isRealtimeMode: true).chrome == .realtime)
+
+        _ = state.send(.startSucceeded(sessionID: sessionID))
+        #expect(RecordingOverlayView(appState: state, isRealtimeMode: true).chrome == .realtime)
+
+        _ = state.send(.stopRequested)
+
+        #expect(RecordingOverlayView(appState: state, isRealtimeMode: true).chrome == .realtime)
+    }
+
     @Test("real-time text can grow past three lines without re-entering AppKit constraints")
     @MainActor
     func multilineRealtimeText() async throws {
@@ -56,9 +76,19 @@ struct RecordingOverlayViewLayoutTests {
         _ = NSApplication.shared
 
         let state = AppState()
-        state.status = .recording
-        state.pendingCopyText = "포커스를 잃은 동안 말한 문장"
-        state.isAwaitingPendingPaste = true
+        let effects = state.send(.toggleRequested(targetBundleIdentifier: nil, targetName: nil))
+        guard case .startCapture(let sessionID)? = effects.first else {
+            Issue.record("Expected startCapture effect")
+            return
+        }
+        _ = state.send(.startSucceeded(sessionID: sessionID))
+        _ = state.send(.focusChanged(sessionID: sessionID, isTargetActive: false))
+        _ = state.send(.segmentFinalized(
+            sessionID: sessionID,
+            text: "포커스를 잃은 동안 말한 문장",
+            isTargetActive: false
+        ))
+        _ = state.send(.focusChanged(sessionID: sessionID, isTargetActive: true))
 
         let rootView = RecordingOverlayView(
             appState: state,
