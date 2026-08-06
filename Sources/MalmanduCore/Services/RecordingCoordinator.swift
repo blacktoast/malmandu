@@ -3,6 +3,7 @@ import Foundation
 import Observation
 
 /// 녹음 → STT → 붙여넣기 파이프라인 조율자
+@MainActor
 @Observable
 public final class RecordingCoordinator: @unchecked Sendable {
     public let appState: AppState
@@ -24,7 +25,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
     /// 현재 활성화된 스트리밍 클라이언트 (RT 모드 녹음 중)
     private var activeStreamingClient: (any StreamingSTTServiceProtocol)?
     /// 녹음 시작 시 포커스되어 있던 앱의 번들 ID
-    public private(set) var startingAppBundleId: String?
+    public var startingAppBundleId: String? { appState.startingAppBundleIdentifier }
     /// 포커스 변화 감시 태스크
     private var focusObserver: Task<Void, Never>?
     /// 비동기 모드 오디오 레벨 폴링 타이머
@@ -34,11 +35,10 @@ public final class RecordingCoordinator: @unchecked Sendable {
     private let audioChunkBufferLimit = 150  // 64ms * 150 ≈ 9.6초
     /// RT 모드 초기화 중 stop이 호출됐는지 플래그
     private var stopRequested = false
+    /// start effect가 끝나기 전에 stop/cancel이 들어오면 해당 effect가 정리를 마무리한다.
+    private var startEffectInFlight = false
     /// 대기 문장 중복 붙여넣기 방지
     private var pendingPasteInProgress = false
-    /// 취소 중 스트림 종료가 내보내는 마지막 확정 문장 폐기
-    private var discardFinalizedSegments = false
-
     /// 상태 변경 콜백 (오버레이 제어용)
     public var onStatusChange: ((AppStatus) -> Void)?
     /// 에러 발생 콜백 (토스트 표시용)
@@ -79,65 +79,26 @@ public final class RecordingCoordinator: @unchecked Sendable {
     }
 
     public func toggleRecording() async {
-        switch appState.status {
-        case .idle, .error:
-            await startRecording()
-        case .recording:
-            await stopAndTranscribe()
-        case .transcribing:
-            break // 변환 중에는 무시
-        }
+        let focusDetector = FocusDetector()
+        await dispatch(.toggleRequested(
+            targetBundleIdentifier: frontmostAppBundleId(),
+            targetName: focusDetector.frontmostAppName()
+        ))
     }
 
     /// 녹음을 즉시 취소한다 — 오디오/소켓을 모두 폐기하고 변환 없이 idle로 복귀.
     /// RT/Async 모드 모두 동일하게 동작: 어떤 텍스트도 붙여넣지 않는다.
     @MainActor
     public func cancelRecording() async {
-        guard appState.status == .recording, !discardFinalizedSegments else { return }
-        stopRequested = true
-        discardFinalizedSegments = true
-        defer { discardFinalizedSegments = false }
-
-        // 1. 마이크/녹음 중지 후 파일 즉시 삭제
-        do {
-            let audioURL = try await audioRecorder.stopRecording()
-            try? FileManager.default.removeItem(at: audioURL)
-            print("[Cancel] 오디오 파일 폐기: \(audioURL.lastPathComponent)")
-        } catch {
-            print("[Cancel] 녹음 중지 실패 (무시): \(error)")
-        }
-
-        // 2. RT 모드: WebSocket 종료 (반환 텍스트 무시)
-        if let streamingClient = activeStreamingClient {
-            activeStreamingClient = nil
-            _ = try? await streamingClient.finishStreaming() as String
-            print("[Cancel] RT 스트리밍 클라이언트 종료")
-        }
-
-        // 3. 보조 상태 정리
-        audioChunkBuffer = []
-        focusObserver?.cancel()
-        focusObserver = nil
-        stopMeteringTimer()
-
-        // 4. 앱 상태 리셋: 모든 미확정/대기 텍스트 폐기
-        appState.partialTranscription = nil
-        appState.pendingCopyText = nil
-        appState.focusLost = false
-        appState.isAwaitingPendingPaste = false
-        appState.stopRecording()
-        appState.status = .idle
-        onStatusChange?(.idle)
-
-        soundService.play(.recordingStopped)
+        await dispatch(.cancelRequested)
     }
 
     public func retryLastTranscription() async {
-        guard let audioURL = appState.lastAudioFileURL else { return }
-        startingAppBundleId = frontmostAppBundleId()
-        appState.status = .transcribing
-        onStatusChange?(.transcribing)
-        await transcribeAndPaste(audioURL: audioURL)
+        let focusDetector = FocusDetector()
+        await dispatch(.retryRequested(
+            targetBundleIdentifier: frontmostAppBundleId(),
+            targetName: focusDetector.frontmostAppName()
+        ))
     }
 
     /// 현재 선택된 모델이 실시간 모드인지 확인
@@ -145,14 +106,74 @@ public final class RecordingCoordinator: @unchecked Sendable {
         STTProvider.isRealtimeModel(model())
     }
 
+    private func dispatch(_ action: RecordingAction) async {
+        let effects = reduce(action)
+        for effect in effects {
+            await perform(effect)
+        }
+    }
+
+    private func reduce(_ action: RecordingAction) -> [RecordingEffect] {
+        let previousStatus = appState.status
+        let effects = appState.send(action)
+        if appState.status != previousStatus {
+            onStatusChange?(appState.status)
+        }
+        return effects
+    }
+
+    private func perform(_ effect: RecordingEffect) async {
+        switch effect {
+        case .startCapture(let sessionID):
+            await startRecording(sessionID: sessionID)
+        case .stopCapture(let sessionID):
+            await stopAndTranscribe(sessionID: sessionID)
+        case .cancelCapture(let sessionID):
+            await discardRecording(sessionID: sessionID)
+        case .finishTranscription(let sessionID, let audioURL),
+             .retryTranscription(let sessionID, let audioURL):
+            if let streamingClient = activeStreamingClient {
+                activeStreamingClient = nil
+                await streamingTranscribeAndPaste(
+                    sessionID: sessionID,
+                    streamingClient: streamingClient,
+                    fallbackAudioURL: audioURL
+                )
+            } else {
+                await transcribeAndPaste(sessionID: sessionID, audioURL: audioURL)
+            }
+        case .pasteSegment(let sessionID, let text):
+            let result = await textInjector.pasteText(text)
+            if result == .needsAccessibilityPermission {
+                _ = reduce(.segmentDeliveryFailed(sessionID: sessionID, text: text))
+                onError?(.accessibilityPermissionDenied)
+            }
+        case .pastePending(let sessionID, let text):
+            guard !pendingPasteInProgress else { return }
+            pendingPasteInProgress = true
+            defer { pendingPasteInProgress = false }
+
+            let result = await textInjector.pasteText(text)
+            if result == .needsAccessibilityPermission {
+                _ = reduce(.pendingPasteFailed(sessionID: sessionID))
+                onError?(.accessibilityPermissionDenied)
+            } else {
+                _ = reduce(.pendingPasteSucceeded(sessionID: sessionID, text: text))
+            }
+        }
+    }
+
     // MARK: - 녹음 시작
 
-    private func startRecording() async {
+    private func startRecording(sessionID: UUID) async {
+        startEffectInFlight = true
+        stopRequested = false
+        defer { startEffectInFlight = false }
+
         // API 키 사전 체크
         if !apiKeyCheck() {
             let err = AppError.apiKeyMissing
-            appState.fail(with: err)
-            onStatusChange?(.error)
+            await dispatch(.startFailed(sessionID: sessionID, err))
             onError?(err)
             return
         }
@@ -161,26 +182,27 @@ public final class RecordingCoordinator: @unchecked Sendable {
         // 효과음이 마이크에 포착되지 않도록 딜레이
         try? await Task.sleep(for: startDelay)
 
-        let focusDetector = FocusDetector()
-        startingAppBundleId = frontmostAppBundleId()
-        appState.startingAppName = focusDetector.frontmostAppName()
-        appState.startRecording()
-        onStatusChange?(.recording)
+        guard appState.currentSessionID == sessionID,
+              case .starting = appState.flowState else {
+            await completeInterruptedStart(sessionID: sessionID)
+            return
+        }
 
         do {
             if isRealtimeMode, let streamingClient = streamingClientProvider() {
                 // 실시간 모드: 마이크 먼저 → WebSocket 연결 → 버퍼 flush
                 audioChunkBuffer = []
-                stopRequested = false
 
                 // 1. 마이크 먼저 시작 — WebSocket 연결 중에도 오디오 캡처
                 try await audioRecorder.startRecordingWithStream(
                     onAudioChunk: { [weak self] chunk in
-                        guard let self else { return }
-                        if let client = self.activeStreamingClient {
-                            Task { try? await client.sendAudioChunk(chunk) }
-                        } else if self.audioChunkBuffer.count < self.audioChunkBufferLimit {
-                            self.audioChunkBuffer.append(chunk)
+                        Task { @MainActor [weak self] in
+                            guard let self, self.appState.currentSessionID == sessionID else { return }
+                            if let client = self.activeStreamingClient {
+                                try? await client.sendAudioChunk(chunk)
+                            } else if self.audioChunkBuffer.count < self.audioChunkBufferLimit {
+                                self.audioChunkBuffer.append(chunk)
+                            }
                         }
                     },
                     onAudioLevel: { [weak self] level in
@@ -189,10 +211,18 @@ public final class RecordingCoordinator: @unchecked Sendable {
                             var levels = self.appState.audioLevels
                             levels.removeFirst()
                             levels.append(CGFloat(level))
-                            self.appState.audioLevels = levels
+                            _ = self.reduce(.audioLevelsUpdated(
+                                sessionID: sessionID,
+                                levels: levels
+                            ))
                         }
                     }
                 )
+
+                if stopRequested {
+                    await completeInterruptedStart(sessionID: sessionID)
+                    return
+                }
 
                 // 2. WebSocket 연결
                 try await streamingClient.startStreaming(
@@ -200,12 +230,18 @@ public final class RecordingCoordinator: @unchecked Sendable {
                     model: model(),
                     onPartialResult: { [weak self] partialText in
                         Task { @MainActor [weak self] in
-                            self?.appState.partialTranscription = partialText
+                            _ = self?.reduce(.partialUpdated(
+                                sessionID: sessionID,
+                                text: partialText
+                            ))
                         }
                     },
                     onSegmentFinalized: { [weak self] (confirmedText: String) in
                         guard let self else { return }
-                        await self.handleFinalizedSegment(confirmedText)
+                        await self.handleFinalizedSegment(
+                            confirmedText,
+                            sessionID: sessionID
+                        )
                     }
                 )
 
@@ -213,12 +249,13 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 if stopRequested {
                     audioChunkBuffer = []
                     _ = try? await streamingClient.finishStreaming() as String
+                    await completeInterruptedStart(sessionID: sessionID)
                     print("[RT Pipeline] 초기화 중 취소됨 → WebSocket 정리")
                     return
                 }
 
                 activeStreamingClient = streamingClient
-                startFocusMonitoring()
+                startFocusMonitoring(sessionID: sessionID)
 
                 // 3. 버퍼된 청크 flush
                 let buffered = audioChunkBuffer
@@ -226,31 +263,63 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 for chunk in buffered {
                     try? await streamingClient.sendAudioChunk(chunk)
                 }
+                if stopRequested {
+                    activeStreamingClient = nil
+                    _ = try? await streamingClient.finishStreaming() as String
+                    await completeInterruptedStart(sessionID: sessionID)
+                    return
+                }
+                startEffectInFlight = false
+                await dispatch(.startSucceeded(sessionID: sessionID))
                 print("[RT Pipeline] 실시간 스트리밍 녹음 시작 (버퍼 \(buffered.count)개 flush)")
             } else {
                 // 일반 모드: 파일 기반 녹음
                 try await audioRecorder.startRecording()
+                if stopRequested {
+                    await completeInterruptedStart(sessionID: sessionID)
+                    return
+                }
                 // AVAudioRecorder 미터링으로 오디오 레벨 폴링 (파형 표시용)
-                startMeteringTimer()
+                startMeteringTimer(sessionID: sessionID)
+                startEffectInFlight = false
+                await dispatch(.startSucceeded(sessionID: sessionID))
             }
         } catch {
             audioChunkBuffer = []
             activeStreamingClient = nil
             focusObserver?.cancel()
             focusObserver = nil
+            if stopRequested {
+                await completeInterruptedStart(sessionID: sessionID)
+                return
+            }
             // duckSystemVolume이 이미 호출된 상태이므로 볼륨 복원 (에러 무시)
             do { _ = try await audioRecorder.stopRecording() } catch {}
             let err = AppError.recordingFailed(error.localizedDescription)
-            appState.fail(with: err)
-            onStatusChange?(.error)
+            await dispatch(.startFailed(sessionID: sessionID, err))
             onError?(err)
         }
     }
 
     // MARK: - 녹음 중지 + 변환
 
-    private func stopAndTranscribe() async {
+    private func stopAndTranscribe(sessionID: UUID) async {
         stopRequested = true
+        if startEffectInFlight {
+            if audioRecorder.isRecording() {
+                do {
+                    let audioURL = try await audioRecorder.stopRecording()
+                    try? FileManager.default.removeItem(at: audioURL)
+                    soundService.play(.recordingStopped)
+                } catch {
+                    let err = AppError.recordingFailed(error.localizedDescription)
+                    await dispatch(.captureStopFailed(sessionID: sessionID, err))
+                    onError?(err)
+                }
+            }
+            return
+        }
+
         do {
             let audioURL = try await audioRecorder.stopRecording()
             audioChunkBuffer = []
@@ -259,39 +328,83 @@ public final class RecordingCoordinator: @unchecked Sendable {
             stopMeteringTimer()
             soundService.play(.recordingStopped)
 
-            // RT 모드 초기화 중 취소: 변환 스킵, 즉시 idle 복귀
-            if isRealtimeMode && activeStreamingClient == nil {
-                try? FileManager.default.removeItem(at: audioURL)
-                appState.stopRecording()
-                appState.status = .idle
-                onStatusChange?(.idle)
-                print("[RT Pipeline] 초기화 중 stop — 변환 스킵")
-                return
-            }
-
-            appState.stopRecording()
-            onStatusChange?(.transcribing)
-
-            if let streamingClient = activeStreamingClient {
-                // 실시간 모드: 스트리밍 종료 → 최종 텍스트 수신
-                activeStreamingClient = nil
-                await streamingTranscribeAndPaste(streamingClient: streamingClient, fallbackAudioURL: audioURL)
-            } else {
-                // 일반 모드: 파일 기반 변환
-                await transcribeAndPaste(audioURL: audioURL)
-            }
+            await dispatch(.captureStopped(sessionID: sessionID, audioURL))
         } catch {
-            activeStreamingClient = nil
+            await closeActiveStreamingClient()
+            clearCaptureObservers()
             let err = AppError.recordingFailed(error.localizedDescription)
-            appState.fail(with: err)
-            onStatusChange?(.error)
+            await dispatch(.captureStopFailed(sessionID: sessionID, err))
             onError?(err)
         }
     }
 
+    private func discardRecording(sessionID: UUID) async {
+        stopRequested = true
+
+        if audioRecorder.isRecording() {
+            do {
+                let audioURL = try await audioRecorder.stopRecording()
+                try? FileManager.default.removeItem(at: audioURL)
+                print("[Cancel] 오디오 파일 폐기: \(audioURL.lastPathComponent)")
+                soundService.play(.recordingStopped)
+            } catch {
+                print("[Cancel] 녹음 중지 실패 (무시): \(error)")
+            }
+        }
+
+        if startEffectInFlight {
+            return
+        }
+
+        if activeStreamingClient != nil {
+            await closeActiveStreamingClient()
+            print("[Cancel] RT 스트리밍 클라이언트 종료")
+        }
+
+        clearCaptureObservers()
+        await dispatch(.cancelCompleted(sessionID: sessionID))
+    }
+
+    private func completeInterruptedStart(sessionID: UUID) async {
+        if audioRecorder.isRecording() {
+            if let audioURL = try? await audioRecorder.stopRecording() {
+                try? FileManager.default.removeItem(at: audioURL)
+            }
+        }
+        audioChunkBuffer = []
+        activeStreamingClient = nil
+        clearCaptureObservers()
+
+        switch appState.flowState {
+        case .stopping(_, .finish):
+            await dispatch(.captureUnavailable(sessionID: sessionID))
+        case .stopping(_, .discard):
+            await dispatch(.cancelCompleted(sessionID: sessionID))
+        default:
+            break
+        }
+    }
+
+    private func clearCaptureObservers() {
+        audioChunkBuffer = []
+        focusObserver?.cancel()
+        focusObserver = nil
+        stopMeteringTimer()
+    }
+
+    private func closeActiveStreamingClient() async {
+        guard let streamingClient = activeStreamingClient else { return }
+        activeStreamingClient = nil
+        _ = try? await streamingClient.finishStreaming() as String
+    }
+
     // MARK: - 실시간 스트리밍 변환
 
-    private func streamingTranscribeAndPaste(streamingClient: any StreamingSTTServiceProtocol, fallbackAudioURL: URL) async {
+    private func streamingTranscribeAndPaste(
+        sessionID: UUID,
+        streamingClient: any StreamingSTTServiceProtocol,
+        fallbackAudioURL: URL
+    ) async {
         do {
             // UI가 .transcribing 상태를 렌더링할 시간 확보
             // (소켓이 이미 끊긴 경우 finishStreaming이 즉시 반환되어 Thinking이 안 보이는 문제 방지)
@@ -314,99 +427,57 @@ public final class RecordingCoordinator: @unchecked Sendable {
             } else {
                 print("[RT Pipeline] 실시간 변환 완료 (모든 텍스트 이미 전달됨)")
             }
-            appState.completeTranscription()
-            onStatusChange?(.idle)
+            await dispatch(.transcriptionSucceeded(sessionID: sessionID))
             try? FileManager.default.removeItem(at: fallbackAudioURL)
         } catch {
             print("[RT Pipeline] 실시간 변환 실패, 파일 기반 폴백 시도: \(error)")
-            await transcribeAndPaste(audioURL: fallbackAudioURL)
+            await transcribeAndPaste(sessionID: sessionID, audioURL: fallbackAudioURL)
         }
     }
 
     // MARK: - 포커스 모니터링
 
     @MainActor
-    private func handleFinalizedSegment(_ confirmedText: String) async {
-        guard !discardFinalizedSegments else {
-            appState.partialTranscription = nil
-            return
-        }
-
-        if appState.focusLost || appState.isAwaitingPendingPaste || !isOriginalAppFrontmost {
-            print("[RT Pipeline] 포커스 대기 중, 오버레이 버퍼에 저장")
-            appendPendingText(confirmedText)
-            if !isOriginalAppFrontmost {
-                handleFocusChange(isOriginalAppActive: false)
-            }
-        } else {
-            print("[RT Pipeline] 붙여넣기: \(confirmedText.prefix(50))")
-            let result = await textInjector.pasteText(confirmedText)
-            if result == .needsAccessibilityPermission {
-                print("[RT Pipeline] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
-                onError?(.accessibilityPermissionDenied)
-                appendPendingText(confirmedText)
-            }
-        }
-        appState.partialTranscription = nil
+    private func handleFinalizedSegment(_ confirmedText: String, sessionID: UUID) async {
+        await dispatch(.segmentFinalized(
+            sessionID: sessionID,
+            text: confirmedText,
+            isTargetActive: isOriginalAppFrontmost
+        ))
     }
 
     @MainActor
     func handleFocusChange(isOriginalAppActive: Bool) {
-        guard appState.status == .recording else { return }
-
+        guard let sessionID = appState.currentSessionID else { return }
         if isOriginalAppActive {
             if appState.focusLost {
                 print("[Focus] 원래 앱으로 포커스 복귀")
             }
-            appState.focusLost = false
-            appState.isAwaitingPendingPaste = appState.pendingCopyText?.isEmpty == false
         } else {
             if !appState.focusLost {
                 print("[Focus] 원래 앱에서 포커스 이탈")
             }
-            appState.focusLost = true
-            appState.isAwaitingPendingPaste = false
         }
+        _ = reduce(.focusChanged(
+            sessionID: sessionID,
+            isTargetActive: isOriginalAppActive
+        ))
     }
 
     @MainActor
     public func pastePendingTranscription() async {
-        guard appState.status == .recording,
-              appState.isAwaitingPendingPaste,
-              !pendingPasteInProgress,
-              let pendingText = appState.pendingCopyText,
-              !pendingText.isEmpty else { return }
-
-        guard isOriginalAppFrontmost else {
-            handleFocusChange(isOriginalAppActive: false)
-            return
-        }
-
-        pendingPasteInProgress = true
-        defer { pendingPasteInProgress = false }
-
-        let result = await textInjector.pasteText(pendingText)
-        if result == .needsAccessibilityPermission {
-            onError?(.accessibilityPermissionDenied)
-            return
-        }
-
-        let currentText = appState.pendingCopyText ?? ""
-        if currentText.hasPrefix(pendingText) {
-            let remainingText = String(currentText.dropFirst(pendingText.count))
-            appState.pendingCopyText = remainingText.isEmpty ? nil : remainingText
-        }
-        appState.isAwaitingPendingPaste = appState.pendingCopyText?.isEmpty == false
+        await dispatch(.pastePendingRequested(isTargetActive: isOriginalAppFrontmost))
     }
 
-    private func startFocusMonitoring() {
+    private func startFocusMonitoring(sessionID: UUID) {
         focusObserver?.cancel()
         focusObserver = Task { @MainActor [weak self] in
             let center = NSWorkspace.shared.notificationCenter
             let stream = center.notifications(named: NSWorkspace.didActivateApplicationNotification)
             for await notification in stream {
                 guard let self else { break }
-                guard self.appState.status == .recording else { continue }
+                guard self.appState.currentSessionID == sessionID,
+                      self.appState.status == .recording else { continue }
                 guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { continue }
                 let activeBundleId = app.bundleIdentifier
                 if activeBundleId == self.startingAppBundleId {
@@ -420,7 +491,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
 
     // MARK: - 비동기 모드 오디오 레벨 폴링
 
-    private func startMeteringTimer() {
+    private func startMeteringTimer(sessionID: UUID) {
         meteringTimer?.cancel()
         guard let recorder = audioRecorder as? AudioRecorder else { return }
         meteringTimer = Task { @MainActor [weak self] in
@@ -431,7 +502,10 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 var levels = self.appState.audioLevels
                 levels.removeFirst()
                 levels.append(CGFloat(level))
-                self.appState.audioLevels = levels
+                _ = self.reduce(.audioLevelsUpdated(
+                    sessionID: sessionID,
+                    levels: levels
+                ))
             }
         }
     }
@@ -441,11 +515,6 @@ public final class RecordingCoordinator: @unchecked Sendable {
         meteringTimer = nil
     }
 
-    private func appendPendingText(_ text: String) {
-        guard !text.isEmpty else { return }
-        appState.pendingCopyText = (appState.pendingCopyText ?? "") + text
-    }
-
     private var isOriginalAppFrontmost: Bool {
         guard let startingAppBundleId else { return false }
         return frontmostAppBundleId() == startingAppBundleId
@@ -453,7 +522,7 @@ public final class RecordingCoordinator: @unchecked Sendable {
 
     // MARK: - 파일 기반 변환 (기존 로직)
 
-    private func transcribeAndPaste(audioURL: URL) async {
+    private func transcribeAndPaste(sessionID: UUID, audioURL: URL) async {
         do {
             // 원본 오디오 파일 정보
             let origSize = (try? FileManager.default.attributesOfItem(atPath: audioURL.path)[.size] as? Int) ?? 0
@@ -484,13 +553,15 @@ public final class RecordingCoordinator: @unchecked Sendable {
                 if result == .needsAccessibilityPermission {
                     print("[Async] Accessibility 권한 부재 — 클립보드 복사만 수행, 토스트 안내")
                     onError?(.accessibilityPermissionDenied)
-                    appState.pendingCopyText = text
+                    _ = reduce(.segmentDeliveryFailed(
+                        sessionID: sessionID,
+                        text: text
+                    ))
                 }
             } else {
-                appState.pendingCopyText = text
+                textInjector.copyText(text)
             }
-            appState.completeTranscription()
-            onStatusChange?(.idle)
+            await dispatch(.transcriptionSucceeded(sessionID: sessionID))
             // 성공 시 임시 파일 삭제
             try? FileManager.default.removeItem(at: audioURL)
         } catch {
@@ -500,8 +571,11 @@ public final class RecordingCoordinator: @unchecked Sendable {
             } else {
                 appError = .transcriptionFailed(error.localizedDescription)
             }
-            appState.fail(with: appError, audioURL: audioURL)
-            onStatusChange?(.error)
+            await dispatch(.transcriptionFailed(
+                sessionID: sessionID,
+                appError,
+                audioURL: audioURL
+            ))
             onError?(appError)
         }
     }

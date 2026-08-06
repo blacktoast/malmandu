@@ -140,6 +140,32 @@ struct RecordingCoordinatorFocusBufferTests {
         #expect(appState.status == .idle)
     }
 
+    @Test("Focus-away stop shows progress and recording can restart after completion")
+    func focusAwayStopShowsProgressThenRestarts() async {
+        let (coordinator, appState, streamingClient, _) = makeSUT()
+        streamingClient.suspendFinishStreaming = true
+
+        await coordinator.toggleRecording()
+        coordinator.handleFocusChange(isOriginalAppActive: false)
+        #expect(appState.overlayPresentation == .focusLost)
+
+        let stopTask = Task { await coordinator.toggleRecording() }
+        await waitFor { appState.overlayPresentation == .transcribing }
+        #expect(appState.overlayPresentation == .transcribing)
+
+        try? await Task.sleep(for: .milliseconds(350))
+        #expect(streamingClient.finishStreamingIsSuspended)
+        streamingClient.resumeFinishStreaming()
+        await stopTask.value
+        #expect(appState.status == .idle)
+
+        streamingClient.suspendFinishStreaming = false
+        await coordinator.toggleRecording()
+
+        #expect(appState.status == .recording)
+        #expect(appState.overlayPresentation == .recording)
+    }
+
     @Test("Current frontmost app is rechecked before pending paste")
     func currentAppIsRecheckedBeforePendingPaste() async {
         let focus = MutableFocusProvider()

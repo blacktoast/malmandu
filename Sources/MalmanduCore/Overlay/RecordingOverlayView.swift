@@ -1,5 +1,13 @@
 import SwiftUI
 
+enum RecordingOverlayChrome: Equatable {
+    case hidden
+    case async
+    case realtime
+    case focusLost
+    case pendingPaste
+}
+
 /// 녹음 중 오버레이 뷰 (만두 캐릭터 + 파형 + 실시간 텍스트)
 public struct RecordingOverlayView: View {
     let appState: AppState
@@ -31,15 +39,32 @@ public struct RecordingOverlayView: View {
         self.onPastePending = onPastePending
     }
 
+    var chrome: RecordingOverlayChrome {
+        switch appState.overlayPresentation {
+        case .hidden:
+            .hidden
+        case .focusLost:
+            .focusLost
+        case .pendingPaste:
+            .pendingPaste
+        case .starting, .recording, .transcribing:
+            isRealtimeMode ? .realtime : .async
+        }
+    }
+
+    @ViewBuilder
     public var body: some View {
-        if appState.focusLost {
-            focusLostView
-        } else if appState.isAwaitingPendingPaste {
-            pendingPasteView
-        } else if isRealtimeMode {
-            rtModeView
-        } else {
+        switch chrome {
+        case .hidden:
+            EmptyView()
+        case .async:
             asyncModeView
+        case .realtime:
+            rtModeView
+        case .focusLost:
+            focusLostView
+        case .pendingPaste:
+            pendingPasteView
         }
     }
 
@@ -48,7 +73,7 @@ public struct RecordingOverlayView: View {
             // 만두 + 파형 영역 — 다크 배경 안
             ManduIconGroupView(
                 audioLevels: appState.audioLevels,
-                isTranscribing: appState.status == .transcribing
+                isTranscribing: appState.overlayPresentation == .transcribing
             )
             .padding(.horizontal, 12)
             .padding(.vertical, 12)
@@ -81,10 +106,14 @@ public struct RecordingOverlayView: View {
 
                 ManduIconGroupView(
                     audioLevels: appState.audioLevels,
-                    isTranscribing: appState.status == .transcribing
+                    isTranscribing: appState.overlayPresentation == .transcribing
                 )
-                // 녹음 중 파형 지터 방지 (변환 중일 때는 스피너 애니메이션을 허용해야 함)
-                .transaction { $0.animation = appState.status == .recording ? nil : $0.animation }
+                // 녹음 중 파형 지터 방지 (변환 중 스피너 애니메이션은 유지)
+                .transaction {
+                    $0.animation = appState.overlayPresentation == .transcribing
+                        ? $0.animation
+                        : nil
+                }
 
                 rtTextBox
             }
